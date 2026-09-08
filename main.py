@@ -11,10 +11,8 @@ Pipeline
 Run:
     python main.py
 
-Dependencies:
-    pandas
-    faker
-    ortools
+For the Streamlit dashboard:
+    streamlit run app.py
 """
 
 from __future__ import annotations
@@ -24,12 +22,14 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 import pandas as pd
-from ortools.sat.python import cp_model
 
+try:
+    from ortools.sat.python import cp_model
+except ModuleNotFoundError as exc:
+    raise ModuleNotFoundError(
+        "OR-Tools is required. Install dependencies with: pip install -r requirements.txt"
+    ) from exc
 
-# ---------------------------------------------------------------------------
-# Configuration
-# ---------------------------------------------------------------------------
 
 DEPARTMENTS = ("Engineering", "TRD", "S&T")
 SECTIONS = tuple(f"SEC-{i}" for i in range(1, 6))
@@ -40,13 +40,7 @@ DAY_HOURS = 24
 OUTPUT_DIR = Path(".")
 
 
-# ---------------------------------------------------------------------------
-# Data generation - BDMS / COA simulation
-# ---------------------------------------------------------------------------
-
-
 def _parse_date(start_date: str) -> datetime:
-    """Validate and parse a YYYY-MM-DD date."""
     try:
         return datetime.strptime(start_date, "%Y-%m-%d")
     except ValueError as exc:
@@ -60,7 +54,6 @@ def generate_block_requests(
     seed: int | None = None,
     start_date: str = DEFAULT_START_DATE,
 ) -> pd.DataFrame:
-    """Generate simulated maintenance block requests."""
     if n < 0:
         raise ValueError("n must be >= 0")
 
@@ -88,7 +81,6 @@ def generate_timetable(
     seed: int | None = None,
     start_date: str = DEFAULT_START_DATE,
 ) -> pd.DataFrame:
-    """Generate simulated COA timetable entries."""
     if n < 0:
         raise ValueError("n must be >= 0")
 
@@ -108,44 +100,21 @@ def generate_timetable(
     )
 
 
-# ---------------------------------------------------------------------------
-# Priority scoring
-# ---------------------------------------------------------------------------
-
-
 def score_all_requests(
     requests_df: pd.DataFrame,
     timetable_df: pd.DataFrame,
 ) -> pd.DataFrame:
-    """Add a transparent priority score to every request.
-
-    Formula from the original priority-scoring work:
-        safety_flag * 50
-        + days_since_last_maintenance * 0.3
-        - traffic_density_on_section * 0.5
-    """
     required_requests = {
-        "request_id",
-        "department",
-        "section_id",
-        "requested_date",
-        "duration_hours",
-        "safety_flag",
-        "days_since_last_maintenance",
+        "request_id", "department", "section_id", "requested_date",
+        "duration_hours", "safety_flag", "days_since_last_maintenance",
     }
-    required_timetable = {"section_id"}
-
     missing_requests = required_requests.difference(requests_df.columns)
-    missing_timetable = required_timetable.difference(timetable_df.columns)
     if missing_requests:
         raise ValueError(f"Missing request columns: {sorted(missing_requests)}")
-    if missing_timetable:
-        raise ValueError(f"Missing timetable columns: {sorted(missing_timetable)}")
+    if "section_id" not in timetable_df.columns:
+        raise ValueError("Missing timetable columns: ['section_id']")
 
     scored = requests_df.copy()
-
-    # Vectorised equivalent of repeatedly filtering timetable_df for each row.
-    # This is substantially cheaper for larger datasets.
     density = timetable_df["section_id"].value_counts()
     scored["traffic_density"] = scored["section_id"].map(density).fillna(0).astype(int)
     scored["priority_score"] = (
@@ -157,37 +126,20 @@ def score_all_requests(
     return scored.sort_values("priority_score", ascending=False).reset_index(drop=True)
 
 
-# ---------------------------------------------------------------------------
-# Department merge engine
-# ---------------------------------------------------------------------------
-
-
 def merge_compatible_requests(scored_df: pd.DataFrame) -> pd.DataFrame:
-    """Create joint blocks for different departments on the same section/date.
-
-    Requests can be performed together when they share section + date. The
-    joint block needs only the longest individual duration, while priority is
-    represented by the highest priority among participating requests.
-    """
     required = {
-        "request_id",
-        "department",
-        "section_id",
-        "requested_date",
-        "duration_hours",
-        "priority_score",
+        "request_id", "department", "section_id", "requested_date",
+        "duration_hours", "priority_score",
     }
     missing = required.difference(scored_df.columns)
     if missing:
         raise ValueError(f"Missing merge columns: {sorted(missing)}")
-
     if scored_df.empty:
         return scored_df.copy()
 
-    work = scored_df.copy()
-    group_cols = ["section_id", "requested_date"]
-
-    grouped = work.groupby(group_cols, sort=True, dropna=False)
+    grouped = scored_df.groupby(
+        ["section_id", "requested_date"], sort=True, dropna=False
+    )
     summary = grouped.agg(
         departments=("department", lambda s: tuple(sorted(set(s)))),
         request_ids=("request_id", lambda s: ", ".join(map(str, s))),
@@ -203,7 +155,6 @@ def merge_compatible_requests(scored_df: pd.DataFrame) -> pd.DataFrame:
     summary["hours_saved"] = (
         summary["original_duration_hours"] - summary["duration_hours"]
     )
-
     summary["block_id"] = [f"BLK-{i + 1:03}" for i in range(len(summary))]
     summary["block_type"] = summary["is_joint_block"].map(
         {True: "JOINT", False: "SINGLE"}
@@ -211,39 +162,16 @@ def merge_compatible_requests(scored_df: pd.DataFrame) -> pd.DataFrame:
 
     return summary[
         [
-            "block_id",
-            "section_id",
-            "requested_date",
-            "departments",
-            "request_ids",
-            "request_count",
-            "block_type",
-            "duration_hours",
-            "original_duration_hours",
-            "hours_saved",
-            "priority_score",
+            "block_id", "section_id", "requested_date", "departments",
+            "request_ids", "request_count", "block_type", "duration_hours",
+            "original_duration_hours", "hours_saved", "priority_score",
         ]
     ]
 
 
-# ---------------------------------------------------------------------------
-# CP-SAT scheduler
-# ---------------------------------------------------------------------------
-
-
 def schedule_blocks(blocks_df: pd.DataFrame, day_hours: int = DAY_HOURS) -> pd.DataFrame:
-    """Schedule blocks with CP-SAT, preventing section/date overlap.
-
-    For each section/date, every block is a job requiring exclusive time.
-    CP-SAT minimizes weighted start time, so high-priority blocks are pulled
-    earlier while still respecting the hard no-overlap constraint.
-    """
     required = {
-        "block_id",
-        "section_id",
-        "requested_date",
-        "duration_hours",
-        "priority_score",
+        "block_id", "section_id", "requested_date", "duration_hours", "priority_score"
     }
     missing = required.difference(blocks_df.columns)
     if missing:
@@ -267,8 +195,6 @@ def schedule_blocks(blocks_df: pd.DataFrame, day_hours: int = DAY_HOURS) -> pd.D
         if any(duration <= 0 for duration in durations):
             raise ValueError("duration_hours must contain only positive values")
         if sum(durations) > day_hours:
-            # There is no feasible schedule inside the requested 24-hour day.
-            # Keep the failure explicit instead of silently dropping work.
             raise ValueError(
                 f"No feasible {day_hours}-hour schedule for {section} on {date}: "
                 f"{sum(durations)} hours requested."
@@ -282,24 +208,21 @@ def schedule_blocks(blocks_df: pd.DataFrame, day_hours: int = DAY_HOURS) -> pd.D
 
         for i, duration in enumerate(durations):
             model.Add(ends[i] == starts[i] + duration)
-            intervals.append(
-                model.NewIntervalVar(
-                    starts[i], duration, ends[i], f"interval_{i}"
-                )
-            )
+            intervals.append(model.NewIntervalVar(
+                starts[i], duration, ends[i], f"interval_{i}"
+            ))
 
         model.AddNoOverlap(intervals)
 
-        raw_scores = day_df["priority_score"].astype(float).tolist()
-        minimum = min(raw_scores)
+        scores = day_df["priority_score"].astype(float).tolist()
+        minimum = min(scores)
         shift = abs(minimum) + 1 if minimum < 0 else 0
-        weights = [max(1, int(round((score + shift) * 10))) for score in raw_scores]
+        weights = [max(1, int(round((score + shift) * 10))) for score in scores]
         model.Minimize(sum(starts[i] * weights[i] for i in range(count)))
 
         solver = cp_model.CpSolver()
         solver.parameters.max_time_in_seconds = 5
         status = solver.Solve(model)
-
         if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
             raise RuntimeError(f"CP-SAT could not schedule {section} on {date}")
 
@@ -314,18 +237,12 @@ def schedule_blocks(blocks_df: pd.DataFrame, day_hours: int = DAY_HOURS) -> pd.D
     ).reset_index(drop=True)
 
 
-# ---------------------------------------------------------------------------
-# End-to-end pipeline
-# ---------------------------------------------------------------------------
-
-
 def run_pipeline(
     request_count: int = 15,
     timetable_count: int = 40,
     seed: int = 42,
     output_dir: Path = OUTPUT_DIR,
 ) -> dict[str, pd.DataFrame]:
-    """Run the complete BDMS -> priority -> merge -> CP-SAT pipeline."""
     output_dir.mkdir(parents=True, exist_ok=True)
 
     requests = generate_block_requests(request_count, seed=seed)
@@ -350,7 +267,6 @@ def run_pipeline(
 
 
 def print_summary(results: dict[str, pd.DataFrame]) -> None:
-    """Print concise results for a demo or hackathon presentation."""
     requests = results["requests"]
     blocks = results["blocks"]
     scheduled = results["scheduled"]
@@ -370,15 +286,9 @@ def print_summary(results: dict[str, pd.DataFrame]) -> None:
     print("\n=== FINAL SCHEDULE ===")
 
     columns = [
-        "block_id",
-        "section_id",
-        "requested_date",
-        "departments",
-        "block_type",
-        "duration_hours",
-        "scheduled_start_hr",
-        "scheduled_end_hr",
-        "priority_score",
+        "block_id", "section_id", "requested_date", "departments",
+        "block_type", "duration_hours", "scheduled_start_hr",
+        "scheduled_end_hr", "priority_score",
     ]
     print(scheduled[columns].to_string(index=False))
 
